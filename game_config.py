@@ -12,5 +12,4 @@ class Role(Enum):
     FLOWER_CHILD = "Flower Child"
 
 MIN_PLAYERS = 5
-
 WOLF_RATIO = 3 # One werewolf per 3 players

@@ -78,7 +78,8 @@ class WerewolfGame:
         
     def shuffle_roles(self):
         random.shuffle(self.roles)
-        self.player_roles = {self.players[i].id: self.roles[i] for i in range(len(self.players))}
+        for i, player in enumerate(self.players):
+            player.role = self.roles[i]
         
     def add_role(self, role: Role) -> bool:
         if Role.VILLAGER in self.roles:
@@ -98,17 +99,30 @@ class WerewolfGame:
             return True
         return False
     
-    def lobby_message(self, started=False) -> str:
+    def lobby_msg(self, started=False) -> str:
         msg = "**Werewolf**\n"
-        msg += "*Narrators:*\n"
+        msg += f"*Narrators ({len(self.narrators)}/1):*\n"
         msg += f"{'\n'.join([member.display_name for member in self.narrators]) if self.narrators else 'None'}\n\n"
-        msg += "*Players:*\n"
+        msg += f"*Players ({len(self.players)}/{MIN_PLAYERS}):*\n"
         msg += f"{'\n'.join([member.name for member in self.players]) if self.players else 'None'}\n\n"
         if self.spectators:
             msg += "*Spectators:*\n"
             msg += f"{'\n'.join([member.display_name for member in self.spectators])}\n\n"
         if not started: msg += f"Press 'Start Game' when ready."
         else: msg += "*The game has started!*"
+        return msg
+    
+    def role_msg(self, started=False) -> str:
+        if not started: msg = "**Werewolf - Role Assignment**\n"
+        else: msg = "**Werewolf - Roles Assigned**\n"
+        for player in self.players:
+            role = player.role
+            if role is not None:
+                msg += f"- {player.name}: {role.value}\n"
+                
+        msg += f"\n*Werewolves: {self.roles.count(Role.WEREWOLF)}/{len(self.players)}*"
+        if not started:
+            msg += "\n*Use '/role' to adjust role counts.*"
         return msg
 
 # ============================================================
@@ -119,12 +133,14 @@ load_dotenv()
 TEST_GUILD = discord.Object(id=int(environ.get("DISCORD_GUILD_ID", 0)))
 
 class WerewolfClient(discord.Client):
-    game: WerewolfGame | None
+    game: WerewolfGame | None = None
+    
+    role_msg: discord.Message | None = None
+    role_view: discord.ui.View | None = None
     
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
-        self.game = None
         
     async def setup_hook(self):
         # This copies the global commands over to your guild.
@@ -172,14 +188,16 @@ class NewGameView(discord.ui.View):
     @discord.ui.button(label="Start Game", style=discord.ButtonStyle.green)
     async def start_game_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.update_task.cancel()
-        await interaction.response.edit_message(content=self.game.lobby_message(started=True), view=None)
+        await interaction.response.edit_message(content=self.game.lobby_msg(started=True), view=None)
         self.value = 'start'
+        self.stop()
         
     @discord.ui.button(label="Cancel Game", style=discord.ButtonStyle.red)
     async def cancel_game_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.update_task.cancel()
         await interaction.response.edit_message(content="**Werewolf**\n*Game canceled*", view=None)
         self.value = 'cancel'
+        self.stop()
         
 class AssignRolesView(discord.ui.View):
     def __init__(self, game: WerewolfGame):
@@ -189,20 +207,24 @@ class AssignRolesView(discord.ui.View):
     
     @discord.ui.button(label="Assign Roles", style=discord.ButtonStyle.green)
     async def assign_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.value = 'assign'
+        self.accept = True
+        self.stop()
         
     @discord.ui.button(label="Shuffle Roles", style=discord.ButtonStyle.blurple)
     async def shuffle_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.value = 'shuffle'
+        self.game.shuffle_roles()
+        await interaction.response.edit_message(content=self.game.role_msg(), view=self)
             
 @client.tree.command(name="new-game", description="Opens a new game of Werewolf. Detects players based on voice channel members.", guild=TEST_GUILD)
 async def new_game(interaction: discord.Interaction):
+    print("NEW GAME COMMAND INVOKED")
+    
     guild = interaction.guild
     if guild is None or guild.id != TEST_GUILD.id:
         await interaction.response.send_message("This command can only be used in the configured guild.", ephemeral=True)
         return
     
-    if interaction.channel is None or interaction.channel.id != TEXT_ID.NARRATOR_CONTROL:
+    if interaction.channel is None or interaction.channel.id != TEXT_ID.NARRATOR_CONTROL or interaction.channel.type != discord.ChannelType.text:
         await interaction.response.send_message("This command can only be used in the NARRATOR_CONTROL text channel.", ephemeral=True)
         return
     
@@ -215,34 +237,45 @@ async def new_game(interaction: discord.Interaction):
         await interaction.response.send_message("Voice channel for GENERAL not found.", ephemeral=True)
         return
     
+    # === Lobby Setup ===
+    print("Setting up new game lobby...")
     client.game = WerewolfGame(players=voice_channel.members)
     async def update_lobby_message():
         if client.game is None: raise Exception("Game model is None in lobby task.")
         while True:
             try:
                 client.game.set_players(voice_channel.members)
-                view.start_game_button.disabled = len(client.game.players) < MIN_PLAYERS or len(client.game.narrators) < 1
-                await interaction.edit_original_response(content=client.game.lobby_message(), view=view)
+                lobby_view.start_game_button.disabled = len(client.game.players) < MIN_PLAYERS or len(client.game.narrators) < 1
+                await interaction.edit_original_response(content=client.game.lobby_msg(), view=lobby_view)
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
                 break
             
     update_task = asyncio.create_task(update_lobby_message())
-    view = NewGameView(update_task, client.game)
-    await interaction.response.send_message(client.game.lobby_message(), view=view)
-    await view.wait()
-    if view.value is None or view.value == 'cancel':
+    lobby_view = NewGameView(update_task, client.game)
+    await interaction.response.send_message(client.game.lobby_msg(), view=lobby_view)
+    await lobby_view.wait()
+    print("View awaited")
+    if lobby_view.value is None or lobby_view.value == 'cancel':
         client.game = None
+        print("Game canceled.")
         return
     
-    # Game started    
-    client.game.setup_roles()
-    assign_view = AssignRolesView(client.game)
-    await interaction.followup.send("Roles have been set up. You can assign or shuffle roles before sending them out to players.", view=assign_view) # TODO: Show role list
-    while not assign_view.accept:
-        await assign_view.wait()
+    print("Game started with players:", [p.name for p in client.game.players])
     
-
+    # === Role Assignment ===
+    client.game.setup_roles()
+    
+    client.role_view = AssignRolesView(client.game)
+    client.role_msg = await interaction.channel.send(client.game.role_msg(), view=client.role_view)
+    await client.role_view.wait()
+    await client.role_msg.edit(content=client.game.role_msg(started=True), view=None)
+    
+    print("Roles assigned.")
+    
+    # === Game Setup ===
+    
+    
 @client.tree.command(name="spectate", description="Join or leave the spectator list for the current game.", guild=TEST_GUILD)
 async def spectate(interaction: discord.Interaction, action: Literal["join", "leave"]):
     guild = interaction.guild
@@ -274,6 +307,60 @@ async def spectate(interaction: discord.Interaction, action: Literal["join", "le
             await interaction.response.send_message(f"You have left the spectator list.", ephemeral=True)
         else:
             await interaction.response.send_message(f"Failed to leave: you are not currently a spectator or you are a narrator.", ephemeral=True)
+            
+@client.tree.command(name="role", description="Add or remove a role from the game.", guild=TEST_GUILD)
+async def role(interaction: discord.Interaction, action: Literal["add", "remove", "replace"], role: Role, with_role: Role | None = None):
+    guild = interaction.guild
+    if guild is None or guild.id != TEST_GUILD.id:
+        await interaction.response.send_message("This command can only be used in the configured guild.", ephemeral=True)
+        return
+    
+    if interaction.channel is None or interaction.channel.id != TEXT_ID.NARRATOR_CONTROL:
+        await interaction.response.send_message("This command can only be used in the NARRATOR_CONTROL text channel.", ephemeral=True)
+        return
+    
+    if client.game is None:
+        await interaction.response.send_message("There is no active game to modify roles for.", ephemeral=True)
+        return
+    
+    if client.role_msg is None:
+        await interaction.response.send_message("Cannot modify roles: not in role selection stage.", ephemeral=True)
+        return
+    
+    if action == "add":
+        if role == Role.VILLAGER:
+            await interaction.response.send_message(f"Cannot add Villager role directly. Remove a role instead.", ephemeral=True)
+            return
+        success = client.game.add_role(role)
+        if success:
+            await interaction.response.send_message(f"Added role {role.value}.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Failed to add role {role.value}: no Villager roles left to replace.", ephemeral=True)
+    elif action == "remove" or action == "replace":
+        if role == Role.VILLAGER:
+            await interaction.response.send_message(f"Cannot remove Villager role directly. Add a role instead.", ephemeral=True)
+            return
+        if with_role == Role.VILLAGER: action = "remove"
+        elif with_role is None and action == "replace":
+            await interaction.response.send_message(f"Please specify a role to replace with.", ephemeral=True)
+            return
+        success = client.game.remove_role(role)
+        if success:
+            if action == "remove":
+                await interaction.response.send_message(f"Removed role {role.value}.", ephemeral=True)
+            elif action == "replace":
+                success_add = client.game.add_role(with_role) # type: ignore
+                if success_add:
+                    await interaction.response.send_message(f"Replaced role {role.value} with {with_role.value}.", ephemeral=True) # type: ignore
+                else:
+                    await interaction.response.send_message(f"Failed to add role {with_role.value}.", ephemeral=True) # type: ignore
+        else:
+            if role == Role.WEREWOLF:
+                await interaction.response.send_message(f"Failed to remove role {role.value}: cannot remove last Werewolf.", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"Failed to remove role {role.value}: role not in game.", ephemeral=True)
+        
+    await client.role_msg.edit(content=client.game.role_msg())
 
 @client.tree.command(name="dummies", description="Set a number of dummy players.", guild=TEST_GUILD)
 async def dummies(interaction: discord.Interaction, count: int):
@@ -329,10 +416,10 @@ async def debug_narrator(interaction: discord.Interaction):
 def main():
     token = environ["DISCORD_BOT_TOKEN"]
     
-    logging.basicConfig(level=logging.DEBUG)
+    # logging.basicConfig(level=logging.DEBUG)
     handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
     
-    client.run(token, log_handler=handler, log_level=logging.DEBUG)
+    client.run(token, log_handler=handler, log_level=logging.INFO)
 
 if __name__ == "__main__":
     main()
