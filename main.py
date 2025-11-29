@@ -3,6 +3,7 @@
 import discord
 from discord import app_commands
 import asyncio
+import random
 
 import logging
 from dotenv import load_dotenv
@@ -10,15 +11,33 @@ from os import environ
 from typing import Literal
 
 from guild_config import *
+from game_config import *
 
 # ============================================================
 # MODEL DEFINITIONS
 # ============================================================
 
+class Player:
+    id: int
+    name: str
+    role: Role | None
+    dead: bool = False
+    
+    def __init__(self, id: int, name: str):
+        self.id = id
+        self.name = name
+        self.role = None
+
 class WerewolfGame:
-    players: list[discord.Member]
+    call_members: list[discord.Member] = []
     narrators: list[discord.Member] = []
     spectators: list[discord.Member] = []
+    players: list[Player] = []
+    roles: list[Role] = []
+    
+    # Debug features
+    dummies: list[Player] = []
+    debug_narrator: discord.Member | None = None
     
     def __init__(self, players: list[discord.Member]):
         self.set_players(players)
@@ -38,18 +57,53 @@ class WerewolfGame:
         return False
             
     def set_players(self, members: list[discord.Member] | None = None):
-        if members is None: members = self.players
+        if members is None: members = self.call_members
+        else: self.call_members = members
         self.narrators = [m for m in members if m.get_role(NARRATOR_ROLE) is not None]
-        print(f"n: {len(self.narrators)}")
-        self.players = [m for m in members if m not in self.spectators and m not in self.narrators]
-        print(f"p: {len(self.players)}")
+        self.narrators += [self.debug_narrator] if self.debug_narrator is not None else []
+        self.players = [Player(m.id, m.display_name) for m in members if m not in self.spectators and m not in self.narrators]
+        self.players += self.dummies
+        
+    def setup_roles(self):
+        num_players = len(self.players)
+        num_werewolves = max(1, num_players // WOLF_RATIO)
+        self.roles = [Role.WEREWOLF] * num_werewolves
+        remaining_roles = [role for role in Role if role != Role.WEREWOLF and role != Role.VILLAGER]
+        while remaining_roles and len(self.roles) < num_players:
+            role_pick = random.choice(remaining_roles)
+            remaining_roles.remove(role_pick)
+            self.roles.append(role_pick)
+        self.roles += [Role.VILLAGER] * (num_players - len(self.roles))
+        self.shuffle_roles()
+        
+    def shuffle_roles(self):
+        random.shuffle(self.roles)
+        self.player_roles = {self.players[i].id: self.roles[i] for i in range(len(self.players))}
+        
+    def add_role(self, role: Role) -> bool:
+        if Role.VILLAGER in self.roles:
+            self.roles.remove(Role.VILLAGER)
+            self.roles.append(role)
+            self.shuffle_roles()
+            return True
+        return False
+    
+    def remove_role(self, role: Role) -> bool:
+        if role in self.roles:
+            if role == Role.WEREWOLF and self.roles.count(Role.WEREWOLF) == 1:
+                return False
+            self.roles.remove(role)
+            self.roles.append(Role.VILLAGER)
+            self.shuffle_roles()
+            return True
+        return False
     
     def lobby_message(self, started=False) -> str:
         msg = "**Werewolf**\n"
         msg += "*Narrators:*\n"
         msg += f"{'\n'.join([member.display_name for member in self.narrators]) if self.narrators else 'None'}\n\n"
         msg += "*Players:*\n"
-        msg += f"{'\n'.join([member.display_name for member in self.players]) if self.players else 'None'}\n\n"
+        msg += f"{'\n'.join([member.name for member in self.players]) if self.players else 'None'}\n\n"
         if self.spectators:
             msg += "*Spectators:*\n"
             msg += f"{'\n'.join([member.display_name for member in self.spectators])}\n\n"
@@ -109,20 +163,37 @@ async def test_channel_config(interaction: discord.Interaction):
     await interaction.response.send_message("Sent a test message to all configured channels.", ephemeral=True)
     
 class NewGameView(discord.ui.View):
-    def __init__(self, update_task: asyncio.Task, model: WerewolfGame):
+    def __init__(self, update_task: asyncio.Task, game: WerewolfGame):
         super().__init__(timeout=None)
         self.update_task = update_task
-        self.model = model
+        self.game = game
+        self.value = None
         
     @discord.ui.button(label="Start Game", style=discord.ButtonStyle.green)
     async def start_game_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.update_task.cancel()
-        await interaction.response.edit_message(content=self.model.lobby_message(started=True), view=None)
+        await interaction.response.edit_message(content=self.game.lobby_message(started=True), view=None)
+        self.value = 'start'
         
     @discord.ui.button(label="Cancel Game", style=discord.ButtonStyle.red)
     async def cancel_game_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.update_task.cancel()
         await interaction.response.edit_message(content="**Werewolf**\n*Game canceled*", view=None)
+        self.value = 'cancel'
+        
+class AssignRolesView(discord.ui.View):
+    def __init__(self, game: WerewolfGame):
+        super().__init__(timeout=None)
+        self.game = game
+        self.accept = False
+    
+    @discord.ui.button(label="Assign Roles", style=discord.ButtonStyle.green)
+    async def assign_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = 'assign'
+        
+    @discord.ui.button(label="Shuffle Roles", style=discord.ButtonStyle.blurple)
+    async def shuffle_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = 'shuffle'
             
 @client.tree.command(name="new-game", description="Opens a new game of Werewolf. Detects players based on voice channel members.", guild=TEST_GUILD)
 async def new_game(interaction: discord.Interaction):
@@ -150,7 +221,7 @@ async def new_game(interaction: discord.Interaction):
         while True:
             try:
                 client.game.set_players(voice_channel.members)
-                # view.start_game_button.disabled = len(client.game.players) < 1 or len(client.game.narrators) < 1
+                view.start_game_button.disabled = len(client.game.players) < MIN_PLAYERS or len(client.game.narrators) < 1
                 await interaction.edit_original_response(content=client.game.lobby_message(), view=view)
                 await asyncio.sleep(1)
             except asyncio.CancelledError:
@@ -159,7 +230,18 @@ async def new_game(interaction: discord.Interaction):
     update_task = asyncio.create_task(update_lobby_message())
     view = NewGameView(update_task, client.game)
     await interaction.response.send_message(client.game.lobby_message(), view=view)
-
+    await view.wait()
+    if view.value is None or view.value == 'cancel':
+        client.game = None
+        return
+    
+    # Game started    
+    client.game.setup_roles()
+    assign_view = AssignRolesView(client.game)
+    await interaction.followup.send("Roles have been set up. You can assign or shuffle roles before sending them out to players.", view=assign_view) # TODO: Show role list
+    while not assign_view.accept:
+        await assign_view.wait()
+    
 
 @client.tree.command(name="spectate", description="Join or leave the spectator list for the current game.", guild=TEST_GUILD)
 async def spectate(interaction: discord.Interaction, action: Literal["join", "leave"]):
@@ -192,6 +274,53 @@ async def spectate(interaction: discord.Interaction, action: Literal["join", "le
             await interaction.response.send_message(f"You have left the spectator list.", ephemeral=True)
         else:
             await interaction.response.send_message(f"Failed to leave: you are not currently a spectator or you are a narrator.", ephemeral=True)
+
+@client.tree.command(name="dummies", description="Set a number of dummy players.", guild=TEST_GUILD)
+async def dummies(interaction: discord.Interaction, count: int):
+    guild = interaction.guild
+    if guild is None or guild.id != TEST_GUILD.id:
+        await interaction.response.send_message("This command can only be used in the configured guild.", ephemeral=True)
+        return
+    
+    if interaction.channel is None or interaction.channel.id != TEXT_ID.NARRATOR_CONTROL:
+        await interaction.response.send_message("This command can only be used in the NARRATOR_CONTROL text channel.", ephemeral=True)
+        return
+    
+    if client.game is None:
+        await interaction.response.send_message("There is no active game to set dummies for.", ephemeral=True)
+        return
+    
+    if count < 0:
+        await interaction.response.send_message("Dummy count cannot be negative.", ephemeral=True)
+        return
+    
+    client.game.dummies = [Player(id=-(i+1), name=f"Dummy {i+1}") for i in range(count)]
+    client.game.set_players()
+    await interaction.response.send_message(f"Set {count} dummy players for the game.", ephemeral=True)
+    
+@client.tree.command(name="debug-narrator", description="Set yourself as a narrator (without joining the call).", guild=TEST_GUILD)
+async def debug_narrator(interaction: discord.Interaction):
+    guild = interaction.guild
+    if guild is None or guild.id != TEST_GUILD.id:
+        await interaction.response.send_message("This command can only be used in the configured guild.", ephemeral=True)
+        return
+    
+    if interaction.channel is None or interaction.channel.id != TEXT_ID.NARRATOR_CONTROL:
+        await interaction.response.send_message("This command can only be used in the NARRATOR_CONTROL text channel.", ephemeral=True)
+        return
+    
+    if client.game is None:
+        await interaction.response.send_message("There is no active game to set a debug narrator for.", ephemeral=True)
+        return
+    
+    member = interaction.user
+    if not isinstance(member, discord.Member):
+        await interaction.response.send_message("This command can only be used by guild members.", ephemeral=True)
+        return
+    
+    client.game.debug_narrator = member
+    client.game.set_players()
+    await interaction.response.send_message(f"You have been set as a debug narrator for the game.", ephemeral=True)
 
 # ============================================================
 # MAIN

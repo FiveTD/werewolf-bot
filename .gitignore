@@ -1,3 +1,7 @@
 .env
 
 discord.log
+
+__pycache__/
+.venv/
+.vscode/
