@@ -4,9 +4,14 @@ import discord
 from discord import app_commands
 
 import logging
-from typing import Optional
 from dotenv import load_dotenv
 from os import environ
+
+from channel_config import *
+
+# ============================================================
+# DISCORD CLIENT SETUP
+# ============================================================
 
 load_dotenv()
 TEST_GUILD = discord.Object(id=int(environ.get("DISCORD_GUILD_ID", 0)))
@@ -29,13 +34,32 @@ client = WerewolfClient(intents=intents)
 async def on_ready():
     logging.info(f'Logged in as {client.user}')
 
-@client.tree.command(name="ping", description="Responds with Pong!", guild=TEST_GUILD)
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message('Pong!')
+# ============================================================
+# COMMANDS
+# ============================================================
+
+@client.tree.command(name="test-channel-config", description="Pings every channel to test config setup.", guild=TEST_GUILD)
+async def test_channel_config(interaction: discord.Interaction):
+    guild = interaction.guild
+    if guild is None or guild.id != TEST_GUILD.id:
+        await interaction.response.send_message("This command can only be used in the configured guild.")
+        return
     
-@client.tree.command(name="echo", description="Echoes your message", guild=TEST_GUILD)
-async def echo(interaction: discord.Interaction, message: str):
-    await interaction.response.send_message(message)
+    for channel in TEXT_ID:
+        discord_channel = guild.get_channel(channel)
+        if discord_channel is None or discord_channel.type != discord.ChannelType.text:
+            await interaction.response.send_message(f"Text channel for {channel.name} with ID {channel} not found.")
+        else:
+            try:
+                await discord_channel.send(f"This is a test message for the {channel.name} channel.")
+            except discord.errors.Forbidden as e:
+                await interaction.response.send_message(f"Failed to send message to {channel.name} channel: does the bot have permission?")
+    
+    await interaction.response.send_message("Sent a test message to all configured channels.")
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
     token = environ["DISCORD_BOT_TOKEN"]
