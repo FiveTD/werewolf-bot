@@ -274,7 +274,19 @@ async def new_game(interaction: discord.Interaction):
     print("Roles assigned.")
     
     # === Game Setup ===
-    
+    for player in client.game.players:
+        if player.role is None:
+            raise Exception("Player with None role after role setup")
+        if player.id < 0: continue # Dummy player
+        if player.role.name in TEXT_ID.__members__:
+            player_member = guild.get_member(player.id)
+            if player_member is None:
+                raise Exception("Unable to get member for player")
+            channel_id = TEXT_ID[player.role.name]
+            role_channel = guild.get_channel(channel_id)
+            if role_channel is None:
+                raise Exception("Unable to get role channel")
+            await role_channel.set_permissions(player_member, read_messages=True, send_messages=True)
     
 @client.tree.command(name="spectate", description="Join or leave the spectator list for the current game.", guild=TEST_GUILD)
 async def spectate(interaction: discord.Interaction, action: Literal["join", "leave"]):
@@ -408,6 +420,26 @@ async def debug_narrator(interaction: discord.Interaction):
     client.game.debug_narrator = member
     client.game.set_players()
     await interaction.response.send_message(f"You have been set as a debug narrator for the game.", ephemeral=True)
+
+@client.tree.command(name="cleanup", description="Clean up any setup from a previous game of Werewolf.")
+async def cleanup(interaction: discord.Interaction):
+    guild = interaction.guild
+    if guild is None or guild.id != TEST_GUILD.id:
+        await interaction.response.send_message("This command can only be used in the configured guild.", ephemeral=True)
+        return
+    
+    for channel_id in TEXT_ID:
+        if channel_id == TEXT_ID.NARRATOR_CONTROL or channel_id == TEXT_ID.GENERAL: continue
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            await interaction.response.send_message(f"Unable to locate {channel_id.name} channel.", ephemeral=True)
+            return
+        
+        for target, overwrite in list(channel.overwrites.items()):
+            if isinstance(target, discord.Member):
+                await channel.set_permissions(target, overwrite=None)
+                
+    await interaction.response.send_message("Cleaned up access setup.")
 
 # ============================================================
 # MAIN

@@ -1,4 +1,5 @@
-from enum import IntEnum
+from enum import Enum, IntEnum
+from game_config import *
 
 class TEXT_ID(IntEnum):
     NARRATOR_CONTROL = 1444214467608186993
